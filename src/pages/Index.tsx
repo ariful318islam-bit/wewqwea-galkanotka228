@@ -4,16 +4,19 @@ import { ProcessingStatus } from '@/components/ProcessingStatus';
 import { ChannelTable } from '@/components/ChannelTable';
 import { useChannelProcessor } from '@/hooks/useChannelProcessor';
 import { parseChannelsFile, parseApiKeysFile } from '@/lib/youtube-parser';
-import { exportToExcel } from '@/lib/excel-export';
 import { ChannelInput } from '@/types/channel';
 import { Button } from '@/components/ui/button';
-import { Key, Users, Play, Trash2, RefreshCw, Youtube } from 'lucide-react';
+import { Slider } from '@/components/ui/slider';
+import { Label } from '@/components/ui/label';
+import { Card } from '@/components/ui/card';
+import { Key, Users, Play, Trash2, RefreshCw, Youtube, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 
 const Index = () => {
   const [apiKeys, setApiKeys] = useState<string[]>([]);
   const [channelInputs, setChannelInputs] = useState<ChannelInput[]>([]);
-  
+  const [threadCount, setThreadCount] = useState(5);
+
   const {
     channels,
     processingState,
@@ -52,15 +55,11 @@ const Index = () => {
       toast.error('Please upload channels file');
       return;
     }
-    startProcessing(channelInputs, apiKeys);
+    startProcessing(channelInputs, apiKeys, threadCount);
   };
 
-  const handleExport = () => {
-    exportToExcel(channels);
-    toast.success('Export complete');
-  };
-
-  const canStart = apiKeys.length > 0 && channelInputs.length > 0 && !processingState.isProcessing;
+  const canStart = apiKeys.length > 0 && channelInputs.length > 0 && !processingState.isProcessing && !processingState.validatingKeys;
+  const isWorking = processingState.isProcessing || processingState.validatingKeys;
 
   return (
     <div className="min-h-screen bg-background">
@@ -77,7 +76,7 @@ const Index = () => {
                 <p className="text-xs text-muted-foreground">Channel Data Extractor</p>
               </div>
             </div>
-            
+
             <div className="flex items-center gap-2">
               <Button
                 variant="ghost"
@@ -95,7 +94,7 @@ const Index = () => {
 
       <main className="container max-w-7xl mx-auto px-4 py-8">
         {/* Upload Section */}
-        <div className="grid md:grid-cols-2 gap-6 mb-8">
+        <div className="grid md:grid-cols-2 gap-6 mb-6">
           <FileUpload
             label="API Keys"
             description="Upload api.txt with YouTube Data API keys (one per line)"
@@ -104,7 +103,7 @@ const Index = () => {
             isLoaded={apiKeys.length > 0}
             lineCount={apiKeys.length}
           />
-          
+
           <FileUpload
             label="Channels List"
             description="Upload channels.txt with URLs and custom data (tab-separated)"
@@ -115,40 +114,69 @@ const Index = () => {
           />
         </div>
 
-        {/* Control Section */}
-        <div className="flex flex-wrap items-center gap-4 mb-8">
-          <Button
-            size="lg"
-            onClick={handleStart}
-            disabled={!canStart}
-            className="gap-2 glow-primary"
-          >
-            <Play className="w-5 h-5" />
-            Start Processing
-          </Button>
-          
-          {channels.length > 0 && !processingState.isProcessing && (
-            <Button
-              variant="outline"
-              size="lg"
-              onClick={clearResults}
-              className="gap-2"
-            >
-              <Trash2 className="w-5 h-5" />
-              Clear Results
-            </Button>
-          )}
-          
+        {/* Thread Settings & Controls */}
+        <Card className="p-6 mb-6 bg-card border-border">
+          <div className="flex flex-col md:flex-row md:items-center gap-6">
+            {/* Thread Count Slider */}
+            <div className="flex-1 max-w-md">
+              <div className="flex items-center justify-between mb-2">
+                <Label className="flex items-center gap-2 text-foreground">
+                  <Zap className="w-4 h-4 text-primary" />
+                  Parallel Threads
+                </Label>
+                <span className="text-lg font-mono font-bold text-primary">{threadCount}</span>
+              </div>
+              <Slider
+                value={[threadCount]}
+                onValueChange={(v) => setThreadCount(v[0])}
+                min={1}
+                max={30}
+                step={1}
+                className="w-full"
+                disabled={isWorking}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                More threads = faster processing, but higher API usage
+              </p>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex flex-wrap items-center gap-4">
+              <Button
+                size="lg"
+                onClick={handleStart}
+                disabled={!canStart}
+                className="gap-2 glow-primary"
+              >
+                <Play className="w-5 h-5" />
+                Start Processing
+              </Button>
+
+              {channels.length > 0 && !isWorking && (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  onClick={clearResults}
+                  className="gap-2"
+                >
+                  <Trash2 className="w-5 h-5" />
+                  Clear Results
+                </Button>
+              )}
+            </div>
+          </div>
+
           {canStart && (
-            <p className="text-sm text-muted-foreground">
-              Ready to process <span className="text-primary font-medium">{channelInputs.length}</span> channels 
+            <p className="text-sm text-muted-foreground mt-4 pt-4 border-t border-border">
+              Ready to process <span className="text-primary font-medium">{channelInputs.length}</span> channels
               using <span className="text-primary font-medium">{apiKeys.length}</span> API keys
+              with <span className="text-primary font-medium">{threadCount}</span> parallel threads
             </p>
           )}
-        </div>
+        </Card>
 
         {/* Processing Status */}
-        {processingState.isProcessing && (
+        {isWorking && (
           <div className="mb-8">
             <ProcessingStatus state={processingState} onStop={stopProcessing} />
           </div>
@@ -157,18 +185,12 @@ const Index = () => {
         {/* Results Table */}
         {channels.length > 0 && (
           <section className="animate-fade-in">
-            <h2 className="text-lg font-semibold text-foreground mb-4">
-              Results
-              <span className="ml-2 text-sm font-normal text-muted-foreground">
-                ({channels.filter(c => c.status === 'success').length} / {channels.length})
-              </span>
-            </h2>
-            <ChannelTable channels={channels} onExport={handleExport} />
+            <ChannelTable channels={channels} />
           </section>
         )}
 
         {/* Empty State */}
-        {channels.length === 0 && !processingState.isProcessing && (
+        {channels.length === 0 && !isWorking && (
           <div className="text-center py-20">
             <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-secondary/50 text-muted-foreground mb-4">
               <Youtube className="w-8 h-8" />
@@ -177,8 +199,8 @@ const Index = () => {
               Upload files to get started
             </h3>
             <p className="text-muted-foreground max-w-md mx-auto">
-              Upload your API keys and channels list, then click "Start Processing" 
-              to extract channel data including verification status and contact emails.
+              Upload your API keys and channels list, then click "Start Processing"
+              to extract channel data. Only <span className="text-success font-medium">clean channels</span> (without verification badges) will be exported.
             </p>
           </div>
         )}
