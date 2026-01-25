@@ -1,52 +1,25 @@
 import { useState, useCallback, useRef } from 'react';
-import { ChannelData, ChannelInput, ProcessingState, ApiKeyState } from '@/types/channel';
-import { extractChannelId } from '@/lib/youtube-parser';
-import { supabase } from '@/integrations/supabase/client';
+import { ChannelData, ChannelInput, ProcessingState } from '@/types/channel';
+import { processChannelBatch } from '@/lib/parallel-processor';
+import { keyManager, ApiKeyInfo } from '@/lib/api-key-manager';
 import { toast } from 'sonner';
 
-const CACHE_KEY = 'youtube_parser_cache';
-const CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-interface CacheEntry {
-  data: ChannelData;
-  timestamp: number;
-}
-
-function getCache(): Record<string, CacheEntry> {
-  try {
-    const cached = localStorage.getItem(CACHE_KEY);
-    return cached ? JSON.parse(cached) : {};
-  } catch {
-    return {};
-  }
-}
-
-function setCache(cache: Record<string, CacheEntry>) {
-  try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
-  } catch {
-    console.warn('Failed to save cache');
-  }
-}
-
-function getCachedChannel(channelId: string): ChannelData | null {
-  const cache = getCache();
-  const entry = cache[channelId];
-  if (entry && Date.now() - entry.timestamp < CACHE_EXPIRY_MS) {
-    return entry.data;
-  }
-  return null;
-}
-
-function cacheChannel(channelId: string, data: ChannelData) {
-  const cache = getCache();
-  cache[channelId] = { data, timestamp: Date.now() };
-  setCache(cache);
+export interface ExtendedProcessingState extends ProcessingState {
+  validatingKeys: boolean;
+  keyValidationProgress: number;
+  validatingKeyName: string;
+  keyStats: {
+    total: number;
+    valid: number;
+    invalid: number;
+    exhausted: number;
+  };
+  threadCount: number;
 }
 
 export function useChannelProcessor() {
   const [channels, setChannels] = useState<ChannelData[]>([]);
-  const [processingState, setProcessingState] = useState<ProcessingState>({
+  const [processingState, setProcessingState] = useState<ExtendedProcessingState>({
     isProcessing: false,
     currentIndex: 0,
     totalCount: 0,
@@ -54,164 +27,96 @@ export function useChannelProcessor() {
     errorCount: 0,
     startTime: null,
     estimatedTimeRemaining: null,
-  });
-  
-  const abortRef = useRef(false);
-  const apiKeysRef = useRef<ApiKeyState>({
-    keys: [],
-    currentKeyIndex: 0,
-    quotaExhausted: new Set(),
+    validatingKeys: false,
+    keyValidationProgress: 0,
+    validatingKeyName: '',
+    keyStats: { total: 0, valid: 0, invalid: 0, exhausted: 0 },
+    threadCount: 5,
   });
 
-  const processChannel = useCallback(async (
-    input: ChannelInput,
-    index: number
-  ): Promise<ChannelData> => {
-    const parsed = extractChannelId(input.url);
-    
-    if (!parsed) {
-      return {
-        id: `error-${index}`,
-        url: input.url,
-        title: 'Unknown',
-        description: '',
-        subscriberCount: 0,
-        videoCount: 0,
-        viewCount: 0,
-        publishedAt: '',
-        country: '',
-        thumbnailUrl: '',
-        isVerified: false,
-        verifiedType: 'none',
-        email: null,
-        customData: input.customData,
-        status: 'error',
-        errorMessage: 'Invalid URL format',
-      };
+  const abortRef = useRef({ aborted: false });
+
+  const setThreadCount = useCallback((count: number) => {
+    setProcessingState(prev => ({ ...prev, threadCount: count }));
+  }, []);
+
+  const validateApiKeys = useCallback(async (keys: string[]): Promise<boolean> => {
+    setProcessingState(prev => ({
+      ...prev,
+      validatingKeys: true,
+      keyValidationProgress: 0,
+      validatingKeyName: '',
+      keyStats: { total: keys.length, valid: 0, invalid: 0, exhausted: 0 },
+    }));
+
+    const result = await keyManager.validateKeys(keys, (progress, validating) => {
+      setProcessingState(prev => ({
+        ...prev,
+        keyValidationProgress: progress,
+        validatingKeyName: validating,
+      }));
+    });
+
+    setProcessingState(prev => ({
+      ...prev,
+      validatingKeys: false,
+      keyValidationProgress: 100,
+      validatingKeyName: '',
+      keyStats: {
+        total: keys.length,
+        valid: result.valid.length,
+        invalid: result.invalid.length,
+        exhausted: 0,
+      },
+    }));
+
+    if (result.invalid.length > 0) {
+      toast.warning(`${result.invalid.length} invalid API key(s) removed from pool`);
     }
 
-    // Check cache first
-    const cacheKey = `${parsed.type}:${parsed.value}`;
-    const cached = getCachedChannel(cacheKey);
-    if (cached) {
-      return { ...cached, customData: input.customData, status: 'success' };
+    if (result.valid.length === 0) {
+      toast.error('No valid API keys found');
+      return false;
     }
 
-    // Get next available API key
-    const apiKeys = apiKeysRef.current;
-    let attempts = 0;
-    
-    while (attempts < apiKeys.keys.length) {
-      if (apiKeys.quotaExhausted.size >= apiKeys.keys.length) {
-        throw new Error('All API keys exhausted');
-      }
-      
-      if (apiKeys.quotaExhausted.has(apiKeys.currentKeyIndex)) {
-        apiKeys.currentKeyIndex = (apiKeys.currentKeyIndex + 1) % apiKeys.keys.length;
-        attempts++;
-        continue;
-      }
-      
-      break;
-    }
-
-    const currentKey = apiKeys.keys[apiKeys.currentKeyIndex];
-
-    try {
-      const { data, error } = await supabase.functions.invoke('youtube-channel-info', {
-        body: {
-          channelIdentifier: parsed.value,
-          identifierType: parsed.type,
-          apiKey: currentKey,
-        },
-      });
-
-      if (error) throw error;
-      
-      if (data.error) {
-        if (data.error.includes('quotaExceeded')) {
-          apiKeys.quotaExhausted.add(apiKeys.currentKeyIndex);
-          apiKeys.currentKeyIndex = (apiKeys.currentKeyIndex + 1) % apiKeys.keys.length;
-          toast.warning(`API key #${apiKeys.currentKeyIndex + 1} quota exhausted, switching...`);
-          return processChannel(input, index);
-        }
-        throw new Error(data.error);
-      }
-
-      const channelData: ChannelData = {
-        id: data.channelId,
-        url: input.url,
-        title: data.title,
-        description: data.description,
-        subscriberCount: data.subscriberCount,
-        videoCount: data.videoCount,
-        viewCount: data.viewCount,
-        publishedAt: data.publishedAt,
-        country: data.country,
-        thumbnailUrl: data.thumbnailUrl,
-        isVerified: data.isVerified,
-        verifiedType: data.verifiedType,
-        email: data.email,
-        customData: input.customData,
-        status: 'success',
-      };
-
-      cacheChannel(cacheKey, channelData);
-      return channelData;
-      
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-      return {
-        id: `error-${index}`,
-        url: input.url,
-        title: 'Error',
-        description: '',
-        subscriberCount: 0,
-        videoCount: 0,
-        viewCount: 0,
-        publishedAt: '',
-        country: '',
-        thumbnailUrl: '',
-        isVerified: false,
-        verifiedType: 'none',
-        email: null,
-        customData: input.customData,
-        status: 'error',
-        errorMessage,
-      };
-    }
+    toast.success(`${result.valid.length} valid API key(s) ready`);
+    return true;
   }, []);
 
   const startProcessing = useCallback(async (
     inputs: ChannelInput[],
-    apiKeys: string[]
+    apiKeys: string[],
+    threadCount: number
   ) => {
-    if (inputs.length === 0 || apiKeys.length === 0) {
-      toast.error('Please provide channels and API keys');
+    if (inputs.length === 0) {
+      toast.error('Please provide channels to process');
       return;
     }
 
-    abortRef.current = false;
-    apiKeysRef.current = {
-      keys: apiKeys,
-      currentKeyIndex: 0,
-      quotaExhausted: new Set(),
-    };
+    // Validate API keys first
+    const keysValid = await validateApiKeys(apiKeys);
+    if (!keysValid) return;
 
-    setProcessingState({
+    abortRef.current = { aborted: false };
+
+    const startTime = Date.now();
+    setProcessingState(prev => ({
+      ...prev,
       isProcessing: true,
       currentIndex: 0,
       totalCount: inputs.length,
       completedCount: 0,
       errorCount: 0,
-      startTime: Date.now(),
+      startTime,
       estimatedTimeRemaining: null,
-    });
+      threadCount,
+    }));
 
+    // Initialize channels as pending
     setChannels(inputs.map((input, i) => ({
       id: `pending-${i}`,
       url: input.url,
-      title: 'Loading...',
+      title: 'Waiting...',
       description: '',
       subscriberCount: 0,
       videoCount: 0,
@@ -226,51 +131,51 @@ export function useChannelProcessor() {
       status: 'pending',
     })));
 
-    const results: ChannelData[] = [];
-    let completedCount = 0;
-    let errorCount = 0;
+    // Process with parallel workers
+    await processChannelBatch(
+      inputs,
+      threadCount,
+      {
+        onChannelStart: (index) => {
+          setChannels(prev => prev.map((ch, idx) =>
+            idx === index ? { ...ch, status: 'processing', title: 'Loading...' } : ch
+          ));
+          setProcessingState(prev => ({ ...prev, currentIndex: index }));
+        },
+        onChannelComplete: (index, result) => {
+          setChannels(prev => prev.map((ch, idx) =>
+            idx === index ? result : ch
+          ));
+        },
+        onProgress: (completed, errors, total) => {
+          const elapsed = Date.now() - startTime;
+          const avgTime = elapsed / (completed + errors || 1);
+          const remaining = Math.round((total - completed - errors) * avgTime / 1000);
 
-    for (let i = 0; i < inputs.length; i++) {
-      if (abortRef.current) break;
-
-      setProcessingState(prev => ({
-        ...prev,
-        currentIndex: i,
-      }));
-
-      setChannels(prev => prev.map((ch, idx) => 
-        idx === i ? { ...ch, status: 'processing' } : ch
-      ));
-
-      const result = await processChannel(inputs[i], i);
-      results.push(result);
-
-      if (result.status === 'success') {
-        completedCount++;
-      } else {
-        errorCount++;
-      }
-
-      setChannels(prev => prev.map((ch, idx) => 
-        idx === i ? result : ch
-      ));
-
-      const elapsed = Date.now() - (Date.now() - (inputs.length - i - 1) * (Date.now() / (i + 1)));
-      const avgTime = elapsed / (i + 1);
-      const remaining = Math.round((inputs.length - i - 1) * avgTime / 1000);
-
-      setProcessingState(prev => ({
-        ...prev,
-        completedCount,
-        errorCount,
-        estimatedTimeRemaining: remaining,
-      }));
-
-      // Small delay to avoid rate limiting
-      if (i < inputs.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
+          setProcessingState(prev => ({
+            ...prev,
+            completedCount: completed,
+            errorCount: errors,
+            estimatedTimeRemaining: remaining,
+          }));
+        },
+        onKeyExhausted: (exhaustedCount, remaining) => {
+          setProcessingState(prev => ({
+            ...prev,
+            keyStats: {
+              ...prev.keyStats,
+              exhausted: exhaustedCount,
+              valid: remaining,
+            },
+          }));
+          toast.warning(`API key exhausted. ${remaining} keys remaining.`);
+        },
+        onAllKeysExhausted: () => {
+          toast.error('All API keys have been exhausted!');
+        },
+      },
+      abortRef.current
+    );
 
     setProcessingState(prev => ({
       ...prev,
@@ -278,17 +183,20 @@ export function useChannelProcessor() {
       estimatedTimeRemaining: null,
     }));
 
-    toast.success(`Processing complete: ${completedCount} success, ${errorCount} errors`);
-  }, [processChannel]);
+    const finalState = keyManager.getState();
+    const successCount = channels.filter(c => c.status === 'success').length;
+    toast.success(`Processing complete!`);
+  }, [validateApiKeys]);
 
   const stopProcessing = useCallback(() => {
-    abortRef.current = true;
+    abortRef.current.aborted = true;
     setProcessingState(prev => ({ ...prev, isProcessing: false }));
     toast.info('Processing stopped');
   }, []);
 
   const clearResults = useCallback(() => {
     setChannels([]);
+    keyManager.reset();
     setProcessingState({
       isProcessing: false,
       currentIndex: 0,
@@ -297,11 +205,16 @@ export function useChannelProcessor() {
       errorCount: 0,
       startTime: null,
       estimatedTimeRemaining: null,
+      validatingKeys: false,
+      keyValidationProgress: 0,
+      validatingKeyName: '',
+      keyStats: { total: 0, valid: 0, invalid: 0, exhausted: 0 },
+      threadCount: 5,
     });
   }, []);
 
   const clearCache = useCallback(() => {
-    localStorage.removeItem(CACHE_KEY);
+    localStorage.removeItem('youtube_parser_cache');
     toast.success('Cache cleared');
   }, []);
 
@@ -312,5 +225,6 @@ export function useChannelProcessor() {
     stopProcessing,
     clearResults,
     clearCache,
+    setThreadCount,
   };
 }
